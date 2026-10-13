@@ -1,31 +1,39 @@
 <!doctype html><html lang="zh-Hant-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PASSAGE｜個人雲端繁體中文版</title><style>
 :root{font-family:system-ui,-apple-system,"Noto Sans TC",sans-serif;color:#292536;background:#f8f6fa}*{box-sizing:border-box}body{margin:0}.top{display:flex;flex-wrap:wrap;align-items:center;gap:10px;background:white;padding:10px 18px;border-bottom:1px solid #e5e0e9}.brand{font-weight:750;margin-right:auto;letter-spacing:.3px}.brand small{color:#786a84;font-weight:400}input,button{font:inherit;border:1px solid #cfc5d8;border-radius:7px;padding:9px 12px}button{background:#665574;color:white;border:0;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}.light{background:#eee8f3;color:#564268}.danger{background:#9b5252}.auth{max-width:480px;margin:8vh auto;background:white;padding:26px;border:1px solid #e6dfeb;border-radius:14px;box-shadow:0 10px 35px #33224412}.auth input{width:100%;margin:8px 0}.auth button{margin:8px 5px 8px 0}#app{display:none;height:calc(100vh - 61px)}#engine{height:100%;width:100%;border:0;background:white}#status{font-size:12px;color:#574968}#notice{font-size:12px;color:#934c4c;max-width:350px}.hint{font-size:13px;line-height:1.65;color:#6f6177}.actions{display:flex;align-items:center;flex-wrap:wrap;gap:7px}#configError{color:#a03333} @media(max-width:900px){#app{height:calc(100vh - 116px)}}
 </style><script src="config.js"></script><script src="locale.js"></script></head><body>
-<header class="top"><div class="brand">PASSAGE <small>個人雲端繁體中文版 · v1.3</small></div><div class="actions" id="actions" hidden><span id="status">尚未同步</span><button id="push" class="light">立即同步</button><button id="pull" class="light">從雲端還原</button><button id="logout" class="light">登出</button></div><span id="notice"></span></header>
+<header class="top"><div class="brand">PASSAGE <small>個人雲端繁體中文版 · v1.5</small></div><div class="actions" id="actions" hidden><span id="status">尚未同步</span><button id="push" class="light">立即同步</button><button id="pull" class="light">從雲端還原</button><button id="logout" class="light">登出</button></div><span id="notice"></span></header>
 <section id="auth" class="auth"><h2>登入你的閱讀練習空間</h2><p class="hint">使用同一組 Email 帳號，即可在多台電腦保留練習進度。原始題庫及考試引擎維持獨立、未修改。</p><input id="email" autocomplete="email" type="email" placeholder="Email"><input id="password" autocomplete="current-password" type="password" placeholder="密碼（至少 6 字元）"><button id="signin">登入</button><button id="signup" class="light">註冊</button><p id="configError"></p><p class="hint">首次使用請先照 README 設定 Supabase。此版本不建議兩台電腦同時進行同一份尚未完成的考試；如有同步衝突，系統會停止上傳而不覆蓋雲端資料。</p></section>
 <main id="app"><iframe id="engine" title="PASSAGE IELTS 閱讀練習"></iframe></main>
 <script>
 (()=>{'use strict';
 const cfg=window.PASSAGE_CLOUD_CONFIG||{}, $=id=>document.getElementById(id);
 const url=(cfg.supabaseUrl||'').replace(/\/$/,''),key=cfg.supabaseAnonKey||'';
-let session=null, revision=0, baseline='', busy=false, running=false, syncTimer=null, lastCloud=null, needsDecision=false, restoring=false, entering=false, authBusy=false, pullBusy=false;
+const SESSION_KEY='passage.cloud.auth.session';
+let session=null, revision=0, baseline='', busy=false, pushInFlight=null, running=false, syncTimer=null, lastCloud=null, needsDecision=false, restoring=false, entering=false, authBusy=false, pullBusy=false;
 const show=(msg,error=false)=>{$('status').textContent=msg; $('notice').textContent=error?msg:'';};
 const headers=(bearer)=>({'apikey':key,'Authorization':'Bearer '+(bearer||key),'Content-Type':'application/json'});
 async function api(path,opts={}){const response=await fetch(url+path,{...opts,headers:{...headers(session?.access_token),...(opts.headers||{})}});const data=await response.json().catch(()=>null);if(!response.ok)throw Error(data?.msg||data?.message||data?.error_description||data?.error||'HTTP '+response.status);return data;}
-function saveSession(s){session=s;try{sessionStorage.setItem('passage.cloud.session',JSON.stringify(s))}catch{}}
+function saveSession(s){session=s;try{localStorage.setItem(SESSION_KEY,JSON.stringify(s))}catch{}}
 async function refresh(){if(!session?.refresh_token)return false;const s=await api('/auth/v1/token?grant_type=refresh_token',{method:'POST',body:JSON.stringify({refresh_token:session.refresh_token})});saveSession(s);return true;}
 async function ensureToken(){if(session?.expires_at && session.expires_at*1000<Date.now()+120000)await refresh();}
-function acceptKey(k){return /^(zyz|ielts-reading|passage)/i.test(k)}
+function acceptKey(k){return k!==SESSION_KEY&&/^(zyz|ielts-reading|passage)/i.test(k)}
 function databaseNames(){return indexedDB.databases?indexedDB.databases().then(a=>a.map(x=>x.name).filter(x=>/^(zyz|ielts-reading|passage)/i.test(x))):Promise.resolve(['zyz-reading-t36-evidence-toggle-display-number-fix-demo-only-20260903-r3-records']);}
 function openDb(name,version){return new Promise((resolve,reject)=>{let q;try{q=version?indexedDB.open(name,version):indexedDB.open(name)}catch(e){reject(e);return}q.onsuccess=()=>resolve(q.result);q.onerror=()=>reject(q.error);q.onblocked=()=>reject(Error('資料庫被另一個分頁鎖住，請關閉其他 PASSAGE 分頁。'));});}
 function readStore(db,name){return new Promise((resolve,reject)=>{const tx=db.transaction(name,'readonly'),st=tx.objectStore(name),req=st.getAll(),kr=st.getAllKeys();let values,keys;req.onsuccess=()=>{values=req.result;if(keys!==undefined)resolve(keys.map((k,i)=>[k,values[i]]))};kr.onsuccess=()=>{keys=kr.result;if(values!==undefined)resolve(keys.map((k,i)=>[k,values[i]]))};tx.onerror=()=>reject(tx.error);});}
 async function snapshot(){const local={};for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(acceptKey(k))local[k]=localStorage.getItem(k)}const dbs={};for(const name of await databaseNames()){if(!name)continue;const db=await openDb(name);const stores={};for(const n of Array.from(db.objectStoreNames)){stores[n]=await readStore(db,n)}dbs[name]={version:db.version,stores};db.close()}return {schema:1,local,dbs};}
-// 已在原版 Chrome 中確認的兩個 Object Store；不對未知 schema 猜測寫入。
+// 已在原版 Chrome 中確認的儲存結構；不對未知 schema 猜測寫入。
 const RECORD_DB=/^zyz-reading-t36-evidence-toggle-display-number-fix-demo-only-20260903-r3-records$/;
+const MANUAL_PRACTICE_DB=/^zyz-reading-manual-practice\.v1$/;
 const STORE_SCHEMAS={
   records:{keyPath:'recordId',indexes:[['releaseId','releaseId'],['type','type'],['updatedAt','updatedAt']]},
-  attemptSnapshots:{keyPath:'snapshotId',indexes:[['updatedAt','updatedAt']]}
+  attemptSnapshots:{keyPath:'snapshotId',indexes:[['updatedAt','updatedAt']]},
+  state:{keyPath:null,indexes:[]}
 };
+function knownStore(name,store){
+  return (RECORD_DB.test(name)&&(store==='records'||store==='attemptSnapshots'))||
+    (MANUAL_PRACTICE_DB.test(name)&&store==='state');
+}
+function expectedDbVersion(name){return RECORD_DB.test(name)?2:MANUAL_PRACTICE_DB.test(name)?1:0}
 function assertPayload(data){
   if(!data||data.schema!==1||!data.local||!data.dbs)throw Error('雲端資料格式不支援');
   for(const [name,info] of Object.entries(data.dbs)){
@@ -50,7 +58,7 @@ async function ensureRestoreSchema(data){
     const needed=Object.entries(info.stores||{}).filter(([,rows])=>rows.length>0).map(([store])=>store);
     if(!needed.length)continue; // 空的 state / 其他 stores 不必建立或覆蓋
     // 有資料的未知 store 仍不得丟棄，必須先確認原始 schema。
-    if(!RECORD_DB.test(name)||needed.some(n=>!STORE_SCHEMAS[n])){
+    if(needed.some(store=>!knownStore(name,store))){
       throw Error('雲端有非空的未知儲存區，為保護紀錄已停止：'+name+' / '+needed.join(',')+'；請勿同步');
     }
     const prior=existing.find(d=>d.name===name);
@@ -67,7 +75,11 @@ async function ensureRestoreSchema(data){
     }
     if(!missing.length)continue;
     // IndexedDB 版本升級是建立 object store 的唯一合法方式。
-    const nextVersion=prior?Number(prior.version)+1:Math.max(2,Number(info.version)||1);
+    const expectedVersion=expectedDbVersion(name);
+    if(prior&&Number(prior.version)>=expectedVersion){
+      throw Error('本機資料庫缺少必要儲存區且無法安全升級：'+name+' / '+missing.join(','));
+    }
+    const nextVersion=expectedVersion;
     await new Promise((resolve,reject)=>{
       const req=indexedDB.open(name,nextVersion);
       req.onupgradeneeded=()=>{
@@ -75,7 +87,7 @@ async function ensureRestoreSchema(data){
         for(const st of missing){
           if(target.objectStoreNames.contains(st))continue;
           const def=STORE_SCHEMAS[st];
-          const store=target.createObjectStore(st,{keyPath:def.keyPath,autoIncrement:false});
+          const store=def.keyPath===null?target.createObjectStore(st):target.createObjectStore(st,{keyPath:def.keyPath,autoIncrement:false});
           for(const [index,keyPath] of def.indexes)store.createIndex(index,keyPath,{unique:false,multiEntry:false});
         }
       };
@@ -90,15 +102,19 @@ async function restore(data){
   if(running)throw Error('必須先關閉練習畫面才能還原');
   await ensureRestoreSchema(data);
   // 寫入前先完整預檢所有非空 stores，避免中途遇到缺失後部分還原。
+  const available=await indexedDB.databases();
+  const present=new Set(available.map(item=>item.name));
+  const storesToRestore=(name,info)=>Object.entries(info.stores||{}).filter(([store,rows])=>
+    rows.length>0||(present.has(name)&&knownStore(name,store)));
   for(const [name,info] of Object.entries(data.dbs)){
-    const active=Object.entries(info.stores||{}).filter(([,rows])=>rows.length>0);
+    const active=storesToRestore(name,info);
     if(!active.length)continue;
     const db=await openDb(name);
     try{for(const [st] of active)if(!schemaReady(db,st))throw Error('資料庫版本不同，缺少或不相容 '+st)}finally{db.close()}
   }
   // 此流程只在明確授權覆寫或新瀏覽器無實際紀錄時執行。
   for(const [name,info] of Object.entries(data.dbs)){
-    const active=Object.entries(info.stores||{}).filter(([,rows])=>rows.length>0);
+    const active=storesToRestore(name,info);
     if(!active.length)continue;
     const db=await openDb(name);
     try{
@@ -116,14 +132,41 @@ async function restore(data){
       }
     }finally{db.close()}
   }
+  // A cloud snapshot is authoritative: remove accepted keys deleted on another device.
+  const localKeys=[];
+  for(let i=0;i<localStorage.length;i++)localKeys.push(localStorage.key(i));
+  for(const k of localKeys)if(acceptKey(k)&&!Object.prototype.hasOwnProperty.call(data.local,k))localStorage.removeItem(k);
   for(const [k,v] of Object.entries(data.local)){if(acceptKey(k))localStorage.setItem(k,v)}
 }
 const canon=x=>JSON.stringify(x);
 async function remote(){await ensureToken();const res=await api('/rest/v1/reading_snapshots?select=revision,payload&limit=1');return res?.[0]||null;}
-async function push(){if(busy||!session||!running||needsDecision||restoring)return;busy=true;try{const snap=await snapshot(),encoded=canon(snap);if(encoded===baseline){show('已同步');return;}const response=await api('/rest/v1/rpc/update_reading_snapshot',{method:'POST',body:JSON.stringify({expected_revision:revision,new_payload:snap})});revision=Number(response);baseline=encoded;show('已同步 · 版本 '+revision);}catch(e){needsDecision=/SYNC_CONFLICT/.test(e.message);show(needsDecision?'發生跨裝置衝突：請先關閉其他裝置，按「從雲端還原」，或備份本機進度後處理。':'同步失敗：'+e.message,true)}finally{busy=false}}
+async function push(){
+  if(pushInFlight)return pushInFlight;
+  if(!session||!running||needsDecision||restoring)return;
+  pushInFlight=(async()=>{
+    busy=true;
+    try{
+      const snap=await snapshot(),encoded=canon(snap);
+      if(encoded===baseline){show('已同步 · 雲端版本 '+revision);return;}
+      show('正在同步…');
+      const response=await api('/rest/v1/rpc/update_reading_snapshot',{method:'POST',body:JSON.stringify({expected_revision:revision,new_payload:snap})});
+      revision=Number(response);baseline=encoded;show('已同步 · 雲端版本 '+revision);
+    }catch(e){
+      needsDecision=/SYNC_CONFLICT/.test(e.message);
+      show(needsDecision?'另一個裝置已有較新紀錄。請停止其他裝置的操作，再按「從雲端還原」。':'同步失敗：'+e.message,true);
+    }finally{busy=false}
+  })();
+  try{return await pushInFlight}finally{pushInFlight=null}
+}
 function translateFrame(frame){let doc;try{doc=frame.contentDocument}catch{return}if(!doc||doc.__passageLocalized)return;doc.__passageLocalized=true;const map=window.PASSAGE_HANT_MAP||{};const words={'登录':'登入','退出登录':'登出','模拟考试':'模擬考試','错题':'錯題','记录':'紀錄','练习':'練習','答题':'答題','设置':'設定','提交':'提交','返回':'返回','解析':'解析','选项':'選項'};function conv(t){if(!/[\u3400-\u9fff]/.test(t))return t;let out=t;for(const [a,b] of Object.entries(words))out=out.split(a).join(b);return [...out].map(ch=>map[ch]||ch).join('');}function traverse(root){const w=doc.createTreeWalker(root,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){if(n.parentNode?.closest('script,style,textarea,code,pre'))continue;const t=conv(n.nodeValue);if(t!==n.nodeValue)n.nodeValue=t}if(root.querySelectorAll)for(const el of root.querySelectorAll('[placeholder],[title],[aria-label]'))for(const a of ['placeholder','title','aria-label']){const t=el.getAttribute(a);if(t){const nt=conv(t);if(nt!==t)el.setAttribute(a,nt)}}}const update=()=>{if(doc.body)traverse(doc.body);for(const child of doc.querySelectorAll('iframe')){translateFrame(child);child.addEventListener('load',()=>translateFrame(child),{once:true})}};update();let timer;new MutationObserver(()=>{clearTimeout(timer);timer=setTimeout(update,250)}).observe(doc.documentElement,{childList:true,subtree:true,characterData:true});}
-function start(){if(running)return;running=true;$('auth').hidden=true;$('app').style.display='block';$('actions').hidden=false;const frame=$('engine');frame.addEventListener('load',()=>translateFrame(frame));frame.src='engine.html';syncTimer=setInterval(()=>{if(!needsDecision)push()},25000);show('v1.4 · 同步已啟用 · 雲端版本 '+revision);}
-async function boot(){if(!url.startsWith('https://')||!key||key.startsWith('YOUR_')){$('configError').textContent='尚未設定 config.js，請參考 README.md。';return}try{session=JSON.parse(sessionStorage.getItem('passage.cloud.session')||'null')}catch{}if(!session)return;try{await ensureToken();await enter()}catch(e){show('登入已過期，請重新登入：'+e.message,true)}}
+function start(){if(running)return;running=true;$('auth').hidden=true;$('app').style.display='block';$('actions').hidden=false;const frame=$('engine');frame.addEventListener('load',()=>translateFrame(frame));frame.src='engine.html';syncTimer=setInterval(()=>{if(!needsDecision)push()},5000);show('v1.5 · 同步已啟用 · 雲端版本 '+revision);}
+async function boot(){
+  if(!url.startsWith('https://')||!key||key.startsWith('YOUR_')){$('configError').textContent='尚未設定 config.js，請參考 README.md。';return}
+  try{session=JSON.parse(localStorage.getItem(SESSION_KEY)||sessionStorage.getItem('passage.cloud.session')||'null');if(session)saveSession(session);sessionStorage.removeItem('passage.cloud.session')}catch{}
+  if(!session)return;
+  try{await ensureToken()}catch(e){session=null;localStorage.removeItem(SESSION_KEY);show('登入已過期，請重新登入：'+e.message,true);return}
+  try{await enter()}catch(e){show('讀取雲端紀錄失敗：'+e.message,true)}
+}
 // 空白快照可能只有 IndexedDB 結構；沒有資料列時無須還原。
 function hasSavedRecords(payload){
   if(!payload || payload.schema!==1) return false;
@@ -248,7 +291,10 @@ async function auth(kind){
   finally{authBusy=false;$('signin').disabled=false;$('signup').disabled=false}
 }
 $('signin').onclick=()=>auth('signin');$('signup').onclick=()=>auth('signup');$('push').onclick=()=>push();$('pull').onclick=async()=>{if(pullBusy||restoring||entering)return;if(!confirm('從雲端還原會覆寫本機 PASSAGE 的練習資料。請確認目前已先做好備份，且沒有練習進行中。確定繼續？'))return;pullBusy=true;$('pull').disabled=true;try{const cloud=await remote();if(!cloud||!hasSavedRecords(cloud.payload)){show('雲端目前沒有實際學習紀錄');return}await prepareCloudRestore(cloud.payload);revision=cloud.revision;baseline=canon(cloud.payload);needsDecision=false;start()}catch(e){show('還原失敗：'+e.message,true)}finally{pullBusy=false;$('pull').disabled=false}};
-$('logout').onclick=async()=>{if(syncTimer)clearInterval(syncTimer);try{await push()}catch{}session=null;sessionStorage.removeItem('passage.cloud.session');location.reload()};
-window.addEventListener('online',()=>{if(running)push()});window.addEventListener('beforeunload',()=>{ /* network sends during unload aren't guaranteed; interval and manual sync are primary */});boot();
+$('logout').onclick=async()=>{if(syncTimer)clearInterval(syncTimer);try{await push()}catch{}session=null;localStorage.removeItem(SESSION_KEY);sessionStorage.removeItem('passage.cloud.session');location.reload()};
+window.addEventListener('online',()=>{if(running)push()});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&running)push()});
+window.addEventListener('pagehide',()=>{if(running)push()});
+boot();
 })();
 </script></body></html>
