@@ -1,14 +1,14 @@
 <!doctype html><html lang="zh-Hant-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PASSAGE｜個人雲端繁體中文版</title><style>
 :root{font-family:system-ui,-apple-system,"Noto Sans TC",sans-serif;color:#292536;background:#f8f6fa}*{box-sizing:border-box}body{margin:0}.top{display:flex;flex-wrap:wrap;align-items:center;gap:10px;background:white;padding:10px 18px;border-bottom:1px solid #e5e0e9}.brand{font-weight:750;margin-right:auto;letter-spacing:.3px}.brand small{color:#786a84;font-weight:400}input,button{font:inherit;border:1px solid #cfc5d8;border-radius:7px;padding:9px 12px}button{background:#665574;color:white;border:0;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}.light{background:#eee8f3;color:#564268}.danger{background:#9b5252}.auth{max-width:480px;margin:8vh auto;background:white;padding:26px;border:1px solid #e6dfeb;border-radius:14px;box-shadow:0 10px 35px #33224412}.auth input{width:100%;margin:8px 0}.auth button{margin:8px 5px 8px 0}#app{display:none;height:calc(100vh - 61px)}#engine{height:100%;width:100%;border:0;background:white}#status{font-size:12px;color:#574968}#notice{font-size:12px;color:#934c4c;max-width:350px}.hint{font-size:13px;line-height:1.65;color:#6f6177}.actions{display:flex;align-items:center;flex-wrap:wrap;gap:7px}#configError{color:#a03333} @media(max-width:900px){#app{height:calc(100vh - 116px)}}
 </style><script src="config.js"></script><script src="locale.js"></script></head><body>
-<header class="top"><div class="brand">PASSAGE <small>個人雲端繁體中文版 · v1</small></div><div class="actions" id="actions" hidden><span id="status">尚未同步</span><button id="push" class="light">立即同步</button><button id="pull" class="light">從雲端還原</button><button id="logout" class="light">登出</button></div><span id="notice"></span></header>
+<header class="top"><div class="brand">PASSAGE <small>個人雲端繁體中文版 · v1.1</small></div><div class="actions" id="actions" hidden><span id="status">尚未同步</span><button id="push" class="light">立即同步</button><button id="pull" class="light">從雲端還原</button><button id="logout" class="light">登出</button></div><span id="notice"></span></header>
 <section id="auth" class="auth"><h2>登入你的閱讀練習空間</h2><p class="hint">使用同一組 Email 帳號，即可在多台電腦保留練習進度。原始題庫及考試引擎維持獨立、未修改。</p><input id="email" autocomplete="email" type="email" placeholder="Email"><input id="password" autocomplete="current-password" type="password" placeholder="密碼（至少 6 字元）"><button id="signin">登入</button><button id="signup" class="light">註冊</button><p id="configError"></p><p class="hint">首次使用請先照 README 設定 Supabase。此版本不建議兩台電腦同時進行同一份尚未完成的考試；如有同步衝突，系統會停止上傳而不覆蓋雲端資料。</p></section>
 <main id="app"><iframe id="engine" title="PASSAGE IELTS 閱讀練習"></iframe></main>
 <script>
 (()=>{'use strict';
 const cfg=window.PASSAGE_CLOUD_CONFIG||{}, $=id=>document.getElementById(id);
 const url=(cfg.supabaseUrl||'').replace(/\/$/,''),key=cfg.supabaseAnonKey||'';
-let session=null, revision=0, baseline='', busy=false, running=false, syncTimer=null, lastCloud=null, needsDecision=false;
+let session=null, revision=0, baseline='', busy=false, running=false, syncTimer=null, lastCloud=null, needsDecision=false, restoring=false;
 const show=(msg,error=false)=>{$('status').textContent=msg; $('notice').textContent=error?msg:'';};
 const headers=(bearer)=>({'apikey':key,'Authorization':'Bearer '+(bearer||key),'Content-Type':'application/json'});
 async function api(path,opts={}){const response=await fetch(url+path,{...opts,headers:{...headers(session?.access_token),...(opts.headers||{})}});const data=await response.json().catch(()=>null);if(!response.ok)throw Error(data?.msg||data?.message||data?.error_description||data?.error||'HTTP '+response.status);return data;}
@@ -23,9 +23,9 @@ async function snapshot(){const local={};for(let i=0;i<localStorage.length;i++){
 async function restore(data){if(!data||data.schema!==1||!data.local||!data.dbs)throw Error('雲端資料格式不支援');if(running)throw Error('必須先關閉練習畫面才能還原');for(const k of Object.keys(data.local)){if(acceptKey(k))localStorage.setItem(k,data.local[k])}for(const [name,info] of Object.entries(data.dbs)){if(!/^(zyz|ielts-reading|passage)/i.test(name))continue;const db=await openDb(name);for(const [store,rows] of Object.entries(info.stores)){if(!db.objectStoreNames.contains(store))throw Error('資料庫版本不同，缺少 '+store+'；已中止匯入，請勿繼續同步');await new Promise((resolve,reject)=>{const t=db.transaction(store,'readwrite'),obj=t.objectStore(store);obj.clear();for(const [k,v] of rows){if(obj.keyPath===null)obj.put(v,k);else obj.put(v)}t.oncomplete=resolve;t.onerror=()=>reject(t.error)});}db.close();}}
 const canon=x=>JSON.stringify(x);
 async function remote(){await ensureToken();const res=await api('/rest/v1/reading_snapshots?select=revision,payload&limit=1');return res?.[0]||null;}
-async function push(){if(busy||!session||!running||needsDecision)return;busy=true;try{const snap=await snapshot(),encoded=canon(snap);if(encoded===baseline){show('已同步');return;}const response=await api('/rest/v1/rpc/update_reading_snapshot',{method:'POST',body:JSON.stringify({expected_revision:revision,new_payload:snap})});revision=Number(response);baseline=encoded;show('已同步 · 版本 '+revision);}catch(e){needsDecision=/SYNC_CONFLICT/.test(e.message);show(needsDecision?'發生跨裝置衝突：請先關閉其他裝置，按「從雲端還原」，或備份本機進度後處理。':'同步失敗：'+e.message,true)}finally{busy=false}}
+async function push(){if(busy||!session||!running||needsDecision||restoring)return;busy=true;try{const snap=await snapshot(),encoded=canon(snap);if(encoded===baseline){show('已同步');return;}const response=await api('/rest/v1/rpc/update_reading_snapshot',{method:'POST',body:JSON.stringify({expected_revision:revision,new_payload:snap})});revision=Number(response);baseline=encoded;show('已同步 · 版本 '+revision);}catch(e){needsDecision=/SYNC_CONFLICT/.test(e.message);show(needsDecision?'發生跨裝置衝突：請先關閉其他裝置，按「從雲端還原」，或備份本機進度後處理。':'同步失敗：'+e.message,true)}finally{busy=false}}
 function translateFrame(frame){let doc;try{doc=frame.contentDocument}catch{return}if(!doc||doc.__passageLocalized)return;doc.__passageLocalized=true;const map=window.PASSAGE_HANT_MAP||{};const words={'登录':'登入','退出登录':'登出','模拟考试':'模擬考試','错题':'錯題','记录':'紀錄','练习':'練習','答题':'答題','设置':'設定','提交':'提交','返回':'返回','解析':'解析','选项':'選項'};function conv(t){if(!/[\u3400-\u9fff]/.test(t))return t;let out=t;for(const [a,b] of Object.entries(words))out=out.split(a).join(b);return [...out].map(ch=>map[ch]||ch).join('');}function traverse(root){const w=doc.createTreeWalker(root,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){if(n.parentNode?.closest('script,style,textarea,code,pre'))continue;const t=conv(n.nodeValue);if(t!==n.nodeValue)n.nodeValue=t}if(root.querySelectorAll)for(const el of root.querySelectorAll('[placeholder],[title],[aria-label]'))for(const a of ['placeholder','title','aria-label']){const t=el.getAttribute(a);if(t){const nt=conv(t);if(nt!==t)el.setAttribute(a,nt)}}}const update=()=>{if(doc.body)traverse(doc.body);for(const child of doc.querySelectorAll('iframe')){translateFrame(child);child.addEventListener('load',()=>translateFrame(child),{once:true})}};update();let timer;new MutationObserver(()=>{clearTimeout(timer);timer=setTimeout(update,250)}).observe(doc.documentElement,{childList:true,subtree:true,characterData:true});}
-function start(){if(running)return;running=true;$('auth').hidden=true;$('app').style.display='block';$('actions').hidden=false;const frame=$('engine');frame.addEventListener('load',()=>translateFrame(frame));frame.src='engine.html';syncTimer=setInterval(()=>{if(!needsDecision)push()},25000);show('同步已啟用');}
+function start(){if(running)return;running=true;$('auth').hidden=true;$('app').style.display='block';$('actions').hidden=false;const frame=$('engine');frame.addEventListener('load',()=>translateFrame(frame));frame.src='engine.html';syncTimer=setInterval(()=>{if(!needsDecision)push()},25000);show('同步已啟用 · 雲端版本 '+revision);}
 async function boot(){if(!url.startsWith('https://')||!key||key.startsWith('YOUR_')){$('configError').textContent='尚未設定 config.js，請參考 README.md。';return}try{session=JSON.parse(sessionStorage.getItem('passage.cloud.session')||'null')}catch{}if(!session)return;try{await ensureToken();await enter()}catch(e){show('登入已過期，請重新登入：'+e.message,true)}}
 // 空白快照可能只有 IndexedDB 結構；沒有資料列時無須還原。
 function hasSavedRecords(payload){
@@ -34,6 +34,76 @@ function hasSavedRecords(payload){
   const hasRows=Object.values(payload.dbs||{}).some(db=>
     Object.values(db.stores||{}).some(rows=>Array.isArray(rows)&&rows.length>0));
   return hasLocal||hasRows;
+}
+// 先讓原始引擎建立自己的 IndexedDB schema；不要自行猜測 keyPath 或 store 定義。
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function missingStores(payload){
+  const missing=[];
+  for(const [name,info] of Object.entries(payload?.dbs||{})){
+    if(!/^(zyz|ielts-reading|passage)/i.test(name)) continue;
+    // 僅查詢現有資料庫，避免 indexedDB.open() 在查詢時建立空資料庫。
+    if(indexedDB.databases){
+      const available=await indexedDB.databases();
+      if(!available.some(item=>item.name===name)){
+        missing.push(name+'（資料庫尚未建立）');continue;
+      }
+    }
+    const db=await openDb(name);
+    try{
+      for(const store of Object.keys(info.stores||{})){
+        if(!db.objectStoreNames.contains(store)) missing.push(name+' / '+store);
+      }
+      if(info.version && db.version < info.version) missing.push(name+'（版本過舊）');
+    }finally{db.close()}
+  }
+  return missing;
+}
+function loadEngine(){
+  const frame=$('engine');
+  return new Promise((resolve,reject)=>{
+    let settled=false;
+    const timer=setTimeout(()=>{
+      if(!settled){settled=true;reject(Error('閱讀引擎初始化逾時'));}
+    },20000);
+    frame.onload=()=>{
+      if(settled)return;
+      settled=true;clearTimeout(timer);
+      translateFrame(frame);resolve();
+    };
+    frame.src='engine.html';
+  });
+}
+async function initializeEngineForRestore(payload){
+  $('auth').hidden=true;
+  $('app').style.display='block';
+  $('actions').hidden=false;
+  show('正在初始化閱讀引擎，暫停同步…');
+  await loadEngine();
+  // engine 可能在 iframe load 之後才非同步建立資料庫。
+  let missing=[];
+  for(let attempt=0;attempt<15;attempt++){
+    missing=await missingStores(payload);
+    if(!missing.length)break;
+    await sleep(500);
+  }
+  if(missing.length){
+    throw Error('閱讀引擎尚未建立必要的儲存區：'+missing.join('、')+'。已停止還原，請勿同步。');
+  }
+  // 結束初始化用的 iframe，讓引擎釋放資料庫連線後再還原。
+  $('engine').src='about:blank';
+  await sleep(500);
+}
+async function prepareCloudRestore(payload){
+  restoring=true;needsDecision=true;
+  try{
+    await initializeEngineForRestore(payload);
+    await restore(payload);
+    needsDecision=false;
+  }catch(e){
+    needsDecision=true;
+    show('還原停止：'+e.message,true);
+    throw e;
+  }finally{restoring=false;}
 }
 async function enter(){
   const cloud=await remote();
@@ -47,8 +117,8 @@ async function enter(){
     if(!choice){needsDecision=true;show('已停止還原；請先備份本機資料。',true);return;}
   }
   if(cloudHasRecords){
-    // 有實際紀錄時維持原本的版本檢查；缺少 Object Store 不可略過。
-    await restore(cloud.payload);
+    // 真正的雲端紀錄：先初始化引擎，再檢查 store 並還原。
+    await prepareCloudRestore(cloud.payload);
   }
   baseline=cloud?.payload?canon(cloud.payload):'';
   start();
@@ -74,9 +144,9 @@ async function auth(kind){
     }
     saveSession(s);
     await enter();
-  }catch(e){$('configError').textContent=e.message}
+  }catch(e){$('configError').textContent=e.message; if(needsDecision)show('已暫停同步：'+e.message,true)}
 }
-$('signin').onclick=()=>auth('signin');$('signup').onclick=()=>auth('signup');$('push').onclick=()=>push();$('pull').onclick=async()=>{if(!confirm('從雲端還原會覆寫本機 PASSAGE 的練習資料。請確認目前已先做好備份，且沒有練習進行中。確定繼續？'))return;try{if(syncTimer)clearInterval(syncTimer);$('engine').src='about:blank';running=false;const cloud=await remote();if(!cloud || !hasSavedRecords(cloud.payload)){show('雲端目前沒有實際學習紀錄');revision=cloud?.revision||0;baseline=cloud?.payload?canon(cloud.payload):'';needsDecision=false;start();return}await restore(cloud.payload);revision=cloud.revision;baseline=canon(cloud.payload);needsDecision=false;start()}catch(e){show('還原失敗：'+e.message,true)}};
+$('signin').onclick=()=>auth('signin');$('signup').onclick=()=>auth('signup');$('push').onclick=()=>push();$('pull').onclick=async()=>{if(!confirm('從雲端還原會覆寫本機 PASSAGE 的練習資料。請確認目前已先做好備份，且沒有練習進行中。確定繼續？'))return;try{if(syncTimer)clearInterval(syncTimer);$('engine').src='about:blank';running=false;const cloud=await remote();if(!cloud || !hasSavedRecords(cloud.payload)){show('雲端目前沒有實際學習紀錄');revision=cloud?.revision||0;baseline=cloud?.payload?canon(cloud.payload):'';needsDecision=false;start();return}await prepareCloudRestore(cloud.payload);revision=cloud.revision;baseline=canon(cloud.payload);needsDecision=false;start()}catch(e){show('還原失敗：'+e.message,true)}};
 $('logout').onclick=async()=>{if(syncTimer)clearInterval(syncTimer);try{await push()}catch{}session=null;sessionStorage.removeItem('passage.cloud.session');location.reload()};
 window.addEventListener('online',()=>{if(running)push()});window.addEventListener('beforeunload',()=>{ /* network sends during unload aren't guaranteed; interval and manual sync are primary */});boot();
 })();
