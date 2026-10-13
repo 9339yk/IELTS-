@@ -49,8 +49,9 @@ async function ensureRestoreSchema(data){
   for(const [name,info] of Object.entries(data.dbs)){
     const needed=Object.entries(info.stores||{}).filter(([,rows])=>rows.length>0).map(([store])=>store);
     if(!needed.length)continue; // 空的 state / 其他 stores 不必建立或覆蓋
+    // 有資料的未知 store 仍不得丟棄，必須先確認原始 schema。
     if(!RECORD_DB.test(name)||needed.some(n=>!STORE_SCHEMAS[n])){
-      throw Error('雲端包含未知或未驗證的儲存結構：'+name+' / '+needed.join(','));
+      throw Error('雲端有非空的未知儲存區，為保護紀錄已停止：'+name+' / '+needed.join(',')+'；請勿同步');
     }
     const prior=existing.find(d=>d.name===name);
     let db;
@@ -121,7 +122,7 @@ const canon=x=>JSON.stringify(x);
 async function remote(){await ensureToken();const res=await api('/rest/v1/reading_snapshots?select=revision,payload&limit=1');return res?.[0]||null;}
 async function push(){if(busy||!session||!running||needsDecision||restoring)return;busy=true;try{const snap=await snapshot(),encoded=canon(snap);if(encoded===baseline){show('已同步');return;}const response=await api('/rest/v1/rpc/update_reading_snapshot',{method:'POST',body:JSON.stringify({expected_revision:revision,new_payload:snap})});revision=Number(response);baseline=encoded;show('已同步 · 版本 '+revision);}catch(e){needsDecision=/SYNC_CONFLICT/.test(e.message);show(needsDecision?'發生跨裝置衝突：請先關閉其他裝置，按「從雲端還原」，或備份本機進度後處理。':'同步失敗：'+e.message,true)}finally{busy=false}}
 function translateFrame(frame){let doc;try{doc=frame.contentDocument}catch{return}if(!doc||doc.__passageLocalized)return;doc.__passageLocalized=true;const map=window.PASSAGE_HANT_MAP||{};const words={'登录':'登入','退出登录':'登出','模拟考试':'模擬考試','错题':'錯題','记录':'紀錄','练习':'練習','答题':'答題','设置':'設定','提交':'提交','返回':'返回','解析':'解析','选项':'選項'};function conv(t){if(!/[\u3400-\u9fff]/.test(t))return t;let out=t;for(const [a,b] of Object.entries(words))out=out.split(a).join(b);return [...out].map(ch=>map[ch]||ch).join('');}function traverse(root){const w=doc.createTreeWalker(root,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){if(n.parentNode?.closest('script,style,textarea,code,pre'))continue;const t=conv(n.nodeValue);if(t!==n.nodeValue)n.nodeValue=t}if(root.querySelectorAll)for(const el of root.querySelectorAll('[placeholder],[title],[aria-label]'))for(const a of ['placeholder','title','aria-label']){const t=el.getAttribute(a);if(t){const nt=conv(t);if(nt!==t)el.setAttribute(a,nt)}}}const update=()=>{if(doc.body)traverse(doc.body);for(const child of doc.querySelectorAll('iframe')){translateFrame(child);child.addEventListener('load',()=>translateFrame(child),{once:true})}};update();let timer;new MutationObserver(()=>{clearTimeout(timer);timer=setTimeout(update,250)}).observe(doc.documentElement,{childList:true,subtree:true,characterData:true});}
-function start(){if(running)return;running=true;$('auth').hidden=true;$('app').style.display='block';$('actions').hidden=false;const frame=$('engine');frame.addEventListener('load',()=>translateFrame(frame));frame.src='engine.html';syncTimer=setInterval(()=>{if(!needsDecision)push()},25000);show('同步已啟用 · 雲端版本 '+revision);}
+function start(){if(running)return;running=true;$('auth').hidden=true;$('app').style.display='block';$('actions').hidden=false;const frame=$('engine');frame.addEventListener('load',()=>translateFrame(frame));frame.src='engine.html';syncTimer=setInterval(()=>{if(!needsDecision)push()},25000);show('v1.4 · 同步已啟用 · 雲端版本 '+revision);}
 async function boot(){if(!url.startsWith('https://')||!key||key.startsWith('YOUR_')){$('configError').textContent='尚未設定 config.js，請參考 README.md。';return}try{session=JSON.parse(sessionStorage.getItem('passage.cloud.session')||'null')}catch{}if(!session)return;try{await ensureToken();await enter()}catch(e){show('登入已過期，請重新登入：'+e.message,true)}}
 // 空白快照可能只有 IndexedDB 結構；沒有資料列時無須還原。
 function hasSavedRecords(payload){
