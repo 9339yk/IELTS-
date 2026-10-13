@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh-Hant-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PASSAGE｜個人雲端繁體中文版</title><style>
 :root{font-family:system-ui,-apple-system,"Noto Sans TC",sans-serif;color:#292536;background:#f8f6fa}*{box-sizing:border-box}body{margin:0}.top{display:flex;flex-wrap:wrap;align-items:center;gap:10px;background:white;padding:10px 18px;border-bottom:1px solid #e5e0e9}.brand{font-weight:750;margin-right:auto;letter-spacing:.3px}.brand small{color:#786a84;font-weight:400}input,button{font:inherit;border:1px solid #cfc5d8;border-radius:7px;padding:9px 12px}button{background:#665574;color:white;border:0;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}.light{background:#eee8f3;color:#564268}.danger{background:#9b5252}.auth{max-width:480px;margin:8vh auto;background:white;padding:26px;border:1px solid #e6dfeb;border-radius:14px;box-shadow:0 10px 35px #33224412}.auth input{width:100%;margin:8px 0}.auth button{margin:8px 5px 8px 0}#app{display:none;height:calc(100vh - 61px)}#engine{height:100%;width:100%;border:0;background:white}#status{font-size:12px;color:#574968}#notice{font-size:12px;color:#934c4c;max-width:350px}.hint{font-size:13px;line-height:1.65;color:#6f6177}.actions{display:flex;align-items:center;flex-wrap:wrap;gap:7px}#configError{color:#a03333} @media(max-width:900px){#app{height:calc(100vh - 116px)}}
 </style><script src="config.js"></script><script src="locale.js"></script></head><body>
-<header class="top"><div class="brand">PASSAGE <small>個人雲端繁體中文版 · v1.1</small></div><div class="actions" id="actions" hidden><span id="status">尚未同步</span><button id="push" class="light">立即同步</button><button id="pull" class="light">從雲端還原</button><button id="logout" class="light">登出</button></div><span id="notice"></span></header>
+<header class="top"><div class="brand">PASSAGE <small>個人雲端繁體中文版 · v1.2</small></div><div class="actions" id="actions" hidden><span id="status">尚未同步</span><button id="push" class="light">立即同步</button><button id="pull" class="light">從雲端還原</button><button id="logout" class="light">登出</button></div><span id="notice"></span></header>
 <section id="auth" class="auth"><h2>登入你的閱讀練習空間</h2><p class="hint">使用同一組 Email 帳號，即可在多台電腦保留練習進度。原始題庫及考試引擎維持獨立、未修改。</p><input id="email" autocomplete="email" type="email" placeholder="Email"><input id="password" autocomplete="current-password" type="password" placeholder="密碼（至少 6 字元）"><button id="signin">登入</button><button id="signup" class="light">註冊</button><p id="configError"></p><p class="hint">首次使用請先照 README 設定 Supabase。此版本不建議兩台電腦同時進行同一份尚未完成的考試；如有同步衝突，系統會停止上傳而不覆蓋雲端資料。</p></section>
 <main id="app"><iframe id="engine" title="PASSAGE IELTS 閱讀練習"></iframe></main>
 <script>
@@ -20,7 +20,103 @@ function databaseNames(){return indexedDB.databases?indexedDB.databases().then(a
 function openDb(name,version){return new Promise((resolve,reject)=>{let q;try{q=version?indexedDB.open(name,version):indexedDB.open(name)}catch(e){reject(e);return}q.onsuccess=()=>resolve(q.result);q.onerror=()=>reject(q.error);q.onblocked=()=>reject(Error('資料庫被另一個分頁鎖住，請關閉其他 PASSAGE 分頁。'));});}
 function readStore(db,name){return new Promise((resolve,reject)=>{const tx=db.transaction(name,'readonly'),st=tx.objectStore(name),req=st.getAll(),kr=st.getAllKeys();let values,keys;req.onsuccess=()=>{values=req.result;if(keys!==undefined)resolve(keys.map((k,i)=>[k,values[i]]))};kr.onsuccess=()=>{keys=kr.result;if(values!==undefined)resolve(keys.map((k,i)=>[k,values[i]]))};tx.onerror=()=>reject(tx.error);});}
 async function snapshot(){const local={};for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(acceptKey(k))local[k]=localStorage.getItem(k)}const dbs={};for(const name of await databaseNames()){if(!name)continue;const db=await openDb(name);const stores={};for(const n of Array.from(db.objectStoreNames)){stores[n]=await readStore(db,n)}dbs[name]={version:db.version,stores};db.close()}return {schema:1,local,dbs};}
-async function restore(data){if(!data||data.schema!==1||!data.local||!data.dbs)throw Error('雲端資料格式不支援');if(running)throw Error('必須先關閉練習畫面才能還原');for(const k of Object.keys(data.local)){if(acceptKey(k))localStorage.setItem(k,data.local[k])}for(const [name,info] of Object.entries(data.dbs)){if(!/^(zyz|ielts-reading|passage)/i.test(name))continue;const db=await openDb(name);for(const [store,rows] of Object.entries(info.stores)){if(!db.objectStoreNames.contains(store))throw Error('資料庫版本不同，缺少 '+store+'；已中止匯入，請勿繼續同步');await new Promise((resolve,reject)=>{const t=db.transaction(store,'readwrite'),obj=t.objectStore(store);obj.clear();for(const [k,v] of rows){if(obj.keyPath===null)obj.put(v,k);else obj.put(v)}t.oncomplete=resolve;t.onerror=()=>reject(t.error)});}db.close();}}
+// 已在原版 Chrome 中確認的兩個 Object Store；不對未知 schema 猜測寫入。
+const RECORD_DB=/^zyz-reading-t36-evidence-toggle-display-number-fix-demo-only-20260903-r3-records$/;
+const STORE_SCHEMAS={
+  records:{keyPath:'recordId',indexes:[['releaseId','releaseId'],['type','type'],['updatedAt','updatedAt']]},
+  attemptSnapshots:{keyPath:'snapshotId',indexes:[['updatedAt','updatedAt']]}
+};
+function assertPayload(data){
+  if(!data||data.schema!==1||!data.local||!data.dbs)throw Error('雲端資料格式不支援');
+  for(const [name,info] of Object.entries(data.dbs)){
+    if(!acceptKey(name))throw Error('非預期的資料庫名稱');
+    for(const [store,rows] of Object.entries(info.stores||{})){
+      if(!Array.isArray(rows))throw Error('雲端儲存資料格式錯誤：'+store);
+      for(const entry of rows)if(!Array.isArray(entry)||entry.length!==2)throw Error('雲端紀錄格式錯誤：'+store);
+    }
+  }
+}
+function schemaReady(db,store){
+  if(!db.objectStoreNames.contains(store))return false;
+  const t=db.transaction(store,'readonly');const o=t.objectStore(store),def=STORE_SCHEMAS[store];
+  if(!def)return true;
+  return o.keyPath===def.keyPath&&!o.autoIncrement&&def.indexes.every(([name,k])=>o.indexNames.contains(name)&&o.index(name).keyPath===k);
+}
+async function ensureRestoreSchema(data){
+  assertPayload(data);
+  if(!indexedDB.databases)throw Error('瀏覽器不支援 IndexedDB.databases()，已安全停止還原');
+  const existing=await indexedDB.databases();
+  for(const [name,info] of Object.entries(data.dbs)){
+    const needed=Object.entries(info.stores||{}).filter(([,rows])=>rows.length>0).map(([store])=>store);
+    if(!needed.length)continue; // 空的 state / 其他 stores 不必建立或覆蓋
+    if(!RECORD_DB.test(name)||needed.some(n=>!STORE_SCHEMAS[n])){
+      throw Error('雲端包含未知或未驗證的儲存結構：'+name+' / '+needed.join(','));
+    }
+    const prior=existing.find(d=>d.name===name);
+    let db;
+    let missing=needed;
+    if(prior){
+      db=await openDb(name); // 先保留既有版本與資料，確認是否需要升級
+      try{
+        for(const st of needed){
+          if(db.objectStoreNames.contains(st)&&!schemaReady(db,st))throw Error('本機 '+st+' 主鍵或索引結構不同，停止還原');
+        }
+        missing=needed.filter(st=>!db.objectStoreNames.contains(st));
+      }finally{db.close()}
+    }
+    if(!missing.length)continue;
+    // IndexedDB 版本升級是建立 object store 的唯一合法方式。
+    const nextVersion=prior?Number(prior.version)+1:Math.max(2,Number(info.version)||1);
+    await new Promise((resolve,reject)=>{
+      const req=indexedDB.open(name,nextVersion);
+      req.onupgradeneeded=()=>{
+        const target=req.result;
+        for(const st of missing){
+          if(target.objectStoreNames.contains(st))continue;
+          const def=STORE_SCHEMAS[st];
+          const store=target.createObjectStore(st,{keyPath:def.keyPath,autoIncrement:false});
+          for(const [index,keyPath] of def.indexes)store.createIndex(index,keyPath,{unique:false,multiEntry:false});
+        }
+      };
+      req.onsuccess=()=>{req.result.close();resolve()};
+      req.onerror=()=>reject(req.error||Error('建立 IndexedDB 儲存區失敗'));
+      req.onblocked=()=>reject(Error('資料庫升級被其他 PASSAGE 分頁阻擋，請關閉其他分頁'));
+    });
+  }
+}
+async function restore(data){
+  assertPayload(data);
+  if(running)throw Error('必須先關閉練習畫面才能還原');
+  await ensureRestoreSchema(data);
+  // 寫入前先完整預檢所有非空 stores，避免中途遇到缺失後部分還原。
+  for(const [name,info] of Object.entries(data.dbs)){
+    const active=Object.entries(info.stores||{}).filter(([,rows])=>rows.length>0);
+    if(!active.length)continue;
+    const db=await openDb(name);
+    try{for(const [st] of active)if(!schemaReady(db,st))throw Error('資料庫版本不同，缺少或不相容 '+st)}finally{db.close()}
+  }
+  // 此流程只在明確授權覆寫或新瀏覽器無實際紀錄時執行。
+  for(const [name,info] of Object.entries(data.dbs)){
+    const active=Object.entries(info.stores||{}).filter(([,rows])=>rows.length>0);
+    if(!active.length)continue;
+    const db=await openDb(name);
+    try{
+      await new Promise((resolve,reject)=>{
+        const t=db.transaction(active.map(([st])=>st),'readwrite');
+        for(const [st,rows] of active){
+          const obj=t.objectStore(st);obj.clear();
+          for(const [k,v] of rows){if(obj.keyPath===null)obj.put(v,k);else obj.put(v)}
+        }
+        t.oncomplete=resolve;t.onerror=()=>reject(t.error);t.onabort=()=>reject(t.error||Error('還原交易已取消'));
+      });
+      for(const [st,rows] of active){
+        const actual=await readStore(db,st);
+        if(actual.length!==rows.length)throw Error('還原驗證失敗：'+st+' 筆數不一致');
+      }
+    }finally{db.close()}
+  }
+  for(const [k,v] of Object.entries(data.local)){if(acceptKey(k))localStorage.setItem(k,v)}
+}
 const canon=x=>JSON.stringify(x);
 async function remote(){await ensureToken();const res=await api('/rest/v1/reading_snapshots?select=revision,payload&limit=1');return res?.[0]||null;}
 async function push(){if(busy||!session||!running||needsDecision||restoring)return;busy=true;try{const snap=await snapshot(),encoded=canon(snap);if(encoded===baseline){show('已同步');return;}const response=await api('/rest/v1/rpc/update_reading_snapshot',{method:'POST',body:JSON.stringify({expected_revision:revision,new_payload:snap})});revision=Number(response);baseline=encoded;show('已同步 · 版本 '+revision);}catch(e){needsDecision=/SYNC_CONFLICT/.test(e.message);show(needsDecision?'發生跨裝置衝突：請先關閉其他裝置，按「從雲端還原」，或備份本機進度後處理。':'同步失敗：'+e.message,true)}finally{busy=false}}
@@ -73,37 +169,15 @@ function loadEngine(){
     frame.src='engine.html';
   });
 }
-async function initializeEngineForRestore(payload){
-  $('auth').hidden=true;
-  $('app').style.display='block';
-  $('actions').hidden=false;
-  show('正在初始化閱讀引擎，暫停同步…');
-  await loadEngine();
-  // engine 可能在 iframe load 之後才非同步建立資料庫。
-  let missing=[];
-  for(let attempt=0;attempt<15;attempt++){
-    missing=await missingStores(payload);
-    if(!missing.length)break;
-    await sleep(500);
-  }
-  if(missing.length){
-    throw Error('閱讀引擎尚未建立必要的儲存區：'+missing.join('、')+'。已停止還原，請勿同步。');
-  }
-  // 結束初始化用的 iframe，讓引擎釋放資料庫連線後再還原。
-  $('engine').src='about:blank';
-  await sleep(500);
-}
 async function prepareCloudRestore(payload){
   restoring=true;needsDecision=true;
   try{
-    await initializeEngineForRestore(payload);
+    show('正在檢查資料庫結構並安全還原，暫停同步…');
     await restore(payload);
     needsDecision=false;
   }catch(e){
-    needsDecision=true;
-    show('還原停止：'+e.message,true);
-    throw e;
-  }finally{restoring=false;}
+    needsDecision=true;show('還原停止：'+e.message,true);throw e;
+  }finally{restoring=false}
 }
 async function enter(){
   const cloud=await remote();
