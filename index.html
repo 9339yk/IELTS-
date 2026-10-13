@@ -1,14 +1,14 @@
 <!doctype html><html lang="zh-Hant-TW"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PASSAGE｜個人雲端繁體中文版</title><style>
 :root{font-family:system-ui,-apple-system,"Noto Sans TC",sans-serif;color:#292536;background:#f8f6fa}*{box-sizing:border-box}body{margin:0}.top{display:flex;flex-wrap:wrap;align-items:center;gap:10px;background:white;padding:10px 18px;border-bottom:1px solid #e5e0e9}.brand{font-weight:750;margin-right:auto;letter-spacing:.3px}.brand small{color:#786a84;font-weight:400}input,button{font:inherit;border:1px solid #cfc5d8;border-radius:7px;padding:9px 12px}button{background:#665574;color:white;border:0;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}.light{background:#eee8f3;color:#564268}.danger{background:#9b5252}.auth{max-width:480px;margin:8vh auto;background:white;padding:26px;border:1px solid #e6dfeb;border-radius:14px;box-shadow:0 10px 35px #33224412}.auth input{width:100%;margin:8px 0}.auth button{margin:8px 5px 8px 0}#app{display:none;height:calc(100vh - 61px)}#engine{height:100%;width:100%;border:0;background:white}#status{font-size:12px;color:#574968}#notice{font-size:12px;color:#934c4c;max-width:350px}.hint{font-size:13px;line-height:1.65;color:#6f6177}.actions{display:flex;align-items:center;flex-wrap:wrap;gap:7px}#configError{color:#a03333} @media(max-width:900px){#app{height:calc(100vh - 116px)}}
 </style><script src="config.js"></script><script src="locale.js"></script></head><body>
-<header class="top"><div class="brand">PASSAGE <small>個人雲端繁體中文版 · v1.2</small></div><div class="actions" id="actions" hidden><span id="status">尚未同步</span><button id="push" class="light">立即同步</button><button id="pull" class="light">從雲端還原</button><button id="logout" class="light">登出</button></div><span id="notice"></span></header>
+<header class="top"><div class="brand">PASSAGE <small>個人雲端繁體中文版 · v1.3</small></div><div class="actions" id="actions" hidden><span id="status">尚未同步</span><button id="push" class="light">立即同步</button><button id="pull" class="light">從雲端還原</button><button id="logout" class="light">登出</button></div><span id="notice"></span></header>
 <section id="auth" class="auth"><h2>登入你的閱讀練習空間</h2><p class="hint">使用同一組 Email 帳號，即可在多台電腦保留練習進度。原始題庫及考試引擎維持獨立、未修改。</p><input id="email" autocomplete="email" type="email" placeholder="Email"><input id="password" autocomplete="current-password" type="password" placeholder="密碼（至少 6 字元）"><button id="signin">登入</button><button id="signup" class="light">註冊</button><p id="configError"></p><p class="hint">首次使用請先照 README 設定 Supabase。此版本不建議兩台電腦同時進行同一份尚未完成的考試；如有同步衝突，系統會停止上傳而不覆蓋雲端資料。</p></section>
 <main id="app"><iframe id="engine" title="PASSAGE IELTS 閱讀練習"></iframe></main>
 <script>
 (()=>{'use strict';
 const cfg=window.PASSAGE_CLOUD_CONFIG||{}, $=id=>document.getElementById(id);
 const url=(cfg.supabaseUrl||'').replace(/\/$/,''),key=cfg.supabaseAnonKey||'';
-let session=null, revision=0, baseline='', busy=false, running=false, syncTimer=null, lastCloud=null, needsDecision=false, restoring=false;
+let session=null, revision=0, baseline='', busy=false, running=false, syncTimer=null, lastCloud=null, needsDecision=false, restoring=false, entering=false, authBusy=false, pullBusy=false;
 const show=(msg,error=false)=>{$('status').textContent=msg; $('notice').textContent=error?msg:'';};
 const headers=(bearer)=>({'apikey':key,'Authorization':'Bearer '+(bearer||key),'Content-Type':'application/json'});
 async function api(path,opts={}){const response=await fetch(url+path,{...opts,headers:{...headers(session?.access_token),...(opts.headers||{})}});const data=await response.json().catch(()=>null);if(!response.ok)throw Error(data?.msg||data?.message||data?.error_description||data?.error||'HTTP '+response.status);return data;}
@@ -169,10 +169,29 @@ function loadEngine(){
     frame.src='engine.html';
   });
 }
+// 還原必須在引擎完全關閉時執行；不可只把 iframe 隱藏。
+async function stopEngineForRestore(){
+  if(syncTimer){clearInterval(syncTimer);syncTimer=null;}
+  running=false; // 在還原前先撤銷執行旗標，避免誤判為正在練習。
+  const frame=$('engine');
+  // 即使尚未啟動 iframe，仍清除可能殘留的先前載入。
+  if(frame.getAttribute('src') && frame.getAttribute('src')!=='about:blank'){
+    await new Promise(resolve=>{
+      let finished=false;
+      const done=()=>{if(finished)return;finished=true;frame.removeEventListener('load',done);clearTimeout(t);resolve();};
+      const t=setTimeout(done,2500);
+      frame.addEventListener('load',done);
+      frame.src='about:blank';
+    });
+  }
+  $('app').style.display='none';
+}
 async function prepareCloudRestore(payload){
+  if(restoring)throw Error('還原程序正在執行，請稍候');
   restoring=true;needsDecision=true;
   try{
-    show('正在檢查資料庫結構並安全還原，暫停同步…');
+    show('正在安全關閉閱讀畫面並還原雲端資料…');
+    await stopEngineForRestore();
     await restore(payload);
     needsDecision=false;
   }catch(e){
@@ -180,24 +199,30 @@ async function prepareCloudRestore(payload){
   }finally{restoring=false}
 }
 async function enter(){
-  const cloud=await remote();
-  revision=cloud?.revision||0;lastCloud=cloud;
-  const local=await snapshot();
-  const localHasRecords=hasSavedRecords(local);
-  const cloudHasRecords=hasSavedRecords(cloud?.payload);
-  // 當本機與雲端皆有實際資料時，必須由使用者決定，禁止默默覆寫。
-  if(cloudHasRecords && localHasRecords){
-    const choice=confirm('雲端與本機都有學習資料。\n按「確定」將採用雲端資料（覆寫本機）。\n按「取消」停止登入，以便先備份。');
-    if(!choice){needsDecision=true;show('已停止還原；請先備份本機資料。',true);return;}
-  }
-  if(cloudHasRecords){
-    // 真正的雲端紀錄：先初始化引擎，再檢查 store 並還原。
-    await prepareCloudRestore(cloud.payload);
-  }
-  baseline=cloud?.payload?canon(cloud.payload):'';
-  start();
+  if(entering)return; // 防止連點登入與自動恢復 Session 競跑。
+  entering=true;
+  try{
+    const cloud=await remote();
+    revision=cloud?.revision||0;lastCloud=cloud;
+    const local=await snapshot();
+    const localHasRecords=hasSavedRecords(local);
+    const cloudHasRecords=hasSavedRecords(cloud?.payload);
+    if(cloudHasRecords && localHasRecords){
+      const choice=confirm('雲端與本機都有學習資料。\n按「確定」將採用雲端資料（覆寫本機）。\n按「取消」停止登入，以便先備份。');
+      if(!choice){needsDecision=true;show('已停止還原；請先備份本機資料。',true);return;}
+    }
+    if(cloudHasRecords){
+      await prepareCloudRestore(cloud.payload);
+    }
+    baseline=cloud?.payload?canon(cloud.payload):'';
+    needsDecision=false;
+    start();
+  }finally{entering=false}
 }
 async function auth(kind){
+  if(authBusy||entering||restoring)return;
+  authBusy=true;
+  $('signin').disabled=true;$('signup').disabled=true;
   try{
     $('configError').textContent='';
     const email=$('email').value.trim(),password=$('password').value;
@@ -219,8 +244,9 @@ async function auth(kind){
     saveSession(s);
     await enter();
   }catch(e){$('configError').textContent=e.message; if(needsDecision)show('已暫停同步：'+e.message,true)}
+  finally{authBusy=false;$('signin').disabled=false;$('signup').disabled=false}
 }
-$('signin').onclick=()=>auth('signin');$('signup').onclick=()=>auth('signup');$('push').onclick=()=>push();$('pull').onclick=async()=>{if(!confirm('從雲端還原會覆寫本機 PASSAGE 的練習資料。請確認目前已先做好備份，且沒有練習進行中。確定繼續？'))return;try{if(syncTimer)clearInterval(syncTimer);$('engine').src='about:blank';running=false;const cloud=await remote();if(!cloud || !hasSavedRecords(cloud.payload)){show('雲端目前沒有實際學習紀錄');revision=cloud?.revision||0;baseline=cloud?.payload?canon(cloud.payload):'';needsDecision=false;start();return}await prepareCloudRestore(cloud.payload);revision=cloud.revision;baseline=canon(cloud.payload);needsDecision=false;start()}catch(e){show('還原失敗：'+e.message,true)}};
+$('signin').onclick=()=>auth('signin');$('signup').onclick=()=>auth('signup');$('push').onclick=()=>push();$('pull').onclick=async()=>{if(pullBusy||restoring||entering)return;if(!confirm('從雲端還原會覆寫本機 PASSAGE 的練習資料。請確認目前已先做好備份，且沒有練習進行中。確定繼續？'))return;pullBusy=true;$('pull').disabled=true;try{const cloud=await remote();if(!cloud||!hasSavedRecords(cloud.payload)){show('雲端目前沒有實際學習紀錄');return}await prepareCloudRestore(cloud.payload);revision=cloud.revision;baseline=canon(cloud.payload);needsDecision=false;start()}catch(e){show('還原失敗：'+e.message,true)}finally{pullBusy=false;$('pull').disabled=false}};
 $('logout').onclick=async()=>{if(syncTimer)clearInterval(syncTimer);try{await push()}catch{}session=null;sessionStorage.removeItem('passage.cloud.session');location.reload()};
 window.addEventListener('online',()=>{if(running)push()});window.addEventListener('beforeunload',()=>{ /* network sends during unload aren't guaranteed; interval and manual sync are primary */});boot();
 })();
