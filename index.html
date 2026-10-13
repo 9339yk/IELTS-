@@ -27,10 +27,56 @@ async function push(){if(busy||!session||!running||needsDecision)return;busy=tru
 function translateFrame(frame){let doc;try{doc=frame.contentDocument}catch{return}if(!doc||doc.__passageLocalized)return;doc.__passageLocalized=true;const map=window.PASSAGE_HANT_MAP||{};const words={'登录':'登入','退出登录':'登出','模拟考试':'模擬考試','错题':'錯題','记录':'紀錄','练习':'練習','答题':'答題','设置':'設定','提交':'提交','返回':'返回','解析':'解析','选项':'選項'};function conv(t){if(!/[\u3400-\u9fff]/.test(t))return t;let out=t;for(const [a,b] of Object.entries(words))out=out.split(a).join(b);return [...out].map(ch=>map[ch]||ch).join('');}function traverse(root){const w=doc.createTreeWalker(root,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){if(n.parentNode?.closest('script,style,textarea,code,pre'))continue;const t=conv(n.nodeValue);if(t!==n.nodeValue)n.nodeValue=t}if(root.querySelectorAll)for(const el of root.querySelectorAll('[placeholder],[title],[aria-label]'))for(const a of ['placeholder','title','aria-label']){const t=el.getAttribute(a);if(t){const nt=conv(t);if(nt!==t)el.setAttribute(a,nt)}}}const update=()=>{if(doc.body)traverse(doc.body);for(const child of doc.querySelectorAll('iframe')){translateFrame(child);child.addEventListener('load',()=>translateFrame(child),{once:true})}};update();let timer;new MutationObserver(()=>{clearTimeout(timer);timer=setTimeout(update,250)}).observe(doc.documentElement,{childList:true,subtree:true,characterData:true});}
 function start(){if(running)return;running=true;$('auth').hidden=true;$('app').style.display='block';$('actions').hidden=false;const frame=$('engine');frame.addEventListener('load',()=>translateFrame(frame));frame.src='engine.html';syncTimer=setInterval(()=>{if(!needsDecision)push()},25000);show('同步已啟用');}
 async function boot(){if(!url.startsWith('https://')||!key||key.startsWith('YOUR_')){$('configError').textContent='尚未設定 config.js，請參考 README.md。';return}try{session=JSON.parse(sessionStorage.getItem('passage.cloud.session')||'null')}catch{}if(!session)return;try{await ensureToken();await enter()}catch(e){show('登入已過期，請重新登入：'+e.message,true)}}
-async function enter(){const cloud=await remote();revision=cloud?.revision||0;lastCloud=cloud;const local=await snapshot(),hasLocal=Object.keys(local.local).length>0||Object.values(local.dbs).some(d=>Object.values(d.stores).some(x=>x.length));if(cloud?.payload && hasLocal){const choice=confirm('雲端已有學習紀錄；本機也有資料。\n按「確定」將採用雲端紀錄（本機將被覆寫）。\n按「取消」保留本機紀錄，暫不開啟練習。');if(!choice){needsDecision=true;show('保留本機紀錄，請先手動備份或清理後再登入。',true);return}}if(cloud?.payload){await restore(cloud.payload);baseline=canon(cloud.payload)}else{baseline=''}start()}
-async function auth(kind){try{$('configError').textContent='';const email=$('email').value.trim(),password=$('password').value;if(!email||!password)throw Error('請填寫 Email 與密碼');let s;if(kind==='signup') {s=await api(
-'/auth/v1/signup?redirect_to=' + encodeURIComponent('https://9339yk.github.io/IELTS-/'),{method:'POST',body:JSON.stringify({email,password})});if(!s?.access_token){$('configError').textContent='註冊成功，請先到信箱完成 Email 驗證再登入。';return}}else s=await api('/auth/v1/token?grant_type=password',{method:'POST',body:JSON.stringify({email,password})});saveSession(s);await enter()}catch(e){$('configError').textContent=e.message}}
-$('signin').onclick=()=>auth('signin');$('signup').onclick=()=>auth('signup');$('push').onclick=()=>push();$('pull').onclick=async()=>{if(!confirm('從雲端還原會覆寫本機 PASSAGE 的練習資料。請確認目前已先做好備份，且沒有練習進行中。確定繼續？'))return;try{if(syncTimer)clearInterval(syncTimer);$('engine').src='about:blank';running=false;const cloud=await remote();if(!cloud){show('雲端尚無資料',true);start();return}await restore(cloud.payload);revision=cloud.revision;baseline=canon(cloud.payload);needsDecision=false;start()}catch(e){show('還原失敗：'+e.message,true)}};
+// 空白快照可能只有 IndexedDB 結構；沒有資料列時無須還原。
+function hasSavedRecords(payload){
+  if(!payload || payload.schema!==1) return false;
+  const hasLocal=Object.keys(payload.local||{}).length>0;
+  const hasRows=Object.values(payload.dbs||{}).some(db=>
+    Object.values(db.stores||{}).some(rows=>Array.isArray(rows)&&rows.length>0));
+  return hasLocal||hasRows;
+}
+async function enter(){
+  const cloud=await remote();
+  revision=cloud?.revision||0;lastCloud=cloud;
+  const local=await snapshot();
+  const localHasRecords=hasSavedRecords(local);
+  const cloudHasRecords=hasSavedRecords(cloud?.payload);
+  // 當本機與雲端皆有實際資料時，必須由使用者決定，禁止默默覆寫。
+  if(cloudHasRecords && localHasRecords){
+    const choice=confirm('雲端與本機都有學習資料。\n按「確定」將採用雲端資料（覆寫本機）。\n按「取消」停止登入，以便先備份。');
+    if(!choice){needsDecision=true;show('已停止還原；請先備份本機資料。',true);return;}
+  }
+  if(cloudHasRecords){
+    // 有實際紀錄時維持原本的版本檢查；缺少 Object Store 不可略過。
+    await restore(cloud.payload);
+  }
+  baseline=cloud?.payload?canon(cloud.payload):'';
+  start();
+}
+async function auth(kind){
+  try{
+    $('configError').textContent='';
+    const email=$('email').value.trim(),password=$('password').value;
+    if(!email||!password)throw Error('請填寫 Email 與密碼');
+    let s;
+    if(kind==='signup'){
+      s=await api('/auth/v1/signup?redirect_to='+encodeURIComponent('https://9339yk.github.io/IELTS-/'),{
+        method:'POST',body:JSON.stringify({email,password})
+      });
+      if(!s?.access_token){
+        $('configError').textContent='註冊成功，請先到信箱完成 Email 驗證再登入。';
+        return;
+      }
+    }else{
+      s=await api('/auth/v1/token?grant_type=password',{
+        method:'POST',body:JSON.stringify({email,password})
+      });
+    }
+    saveSession(s);
+    await enter();
+  }catch(e){$('configError').textContent=e.message}
+}
+$('signin').onclick=()=>auth('signin');$('signup').onclick=()=>auth('signup');$('push').onclick=()=>push();$('pull').onclick=async()=>{if(!confirm('從雲端還原會覆寫本機 PASSAGE 的練習資料。請確認目前已先做好備份，且沒有練習進行中。確定繼續？'))return;try{if(syncTimer)clearInterval(syncTimer);$('engine').src='about:blank';running=false;const cloud=await remote();if(!cloud || !hasSavedRecords(cloud.payload)){show('雲端目前沒有實際學習紀錄');revision=cloud?.revision||0;baseline=cloud?.payload?canon(cloud.payload):'';needsDecision=false;start();return}await restore(cloud.payload);revision=cloud.revision;baseline=canon(cloud.payload);needsDecision=false;start()}catch(e){show('還原失敗：'+e.message,true)}};
 $('logout').onclick=async()=>{if(syncTimer)clearInterval(syncTimer);try{await push()}catch{}session=null;sessionStorage.removeItem('passage.cloud.session');location.reload()};
 window.addEventListener('online',()=>{if(running)push()});window.addEventListener('beforeunload',()=>{ /* network sends during unload aren't guaranteed; interval and manual sync are primary */});boot();
 })();
